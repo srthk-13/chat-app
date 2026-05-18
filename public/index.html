@@ -1,0 +1,181 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NexChat - Real-time Chat</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:opsz,wght@9..40,300;400;500;600&display=swap" rel="stylesheet" />
+  <script src="/socket.io/socket.io.js"></script>
+
+    <link rel="stylesheet" href="/assets/css/styles.css" />
+</head>
+<body>
+
+<!-- 
+     REGISTER SCREEN
+ -->
+<div id="register-screen">
+  <div class="register-card">
+    <div class="logo">Nex<span>Chat</span></div>
+    <p class="register-sub">Choose your username to start chatting</p>
+
+    <div class="field-label">Username</div>
+    <input id="username-input" class="field-input" type="text"
+           placeholder="e.g. cosmic_panda" maxlength="20" autofocus />
+    <div class="register-error" id="register-error"></div>
+
+    <button class="btn-primary" id="join-btn">Join Chat -></button>
+
+    <div class="features-list">
+      <span class="feature-tag g">Global Chat</span>
+      <span class="feature-tag r">Rooms</span>
+      <span class="feature-tag p">Private DMs</span>
+    </div>
+  </div>
+</div>
+
+<!-- 
+     MAIN APP
+ -->
+<div id="app">
+
+  <!-- LEFT SIDEBAR -->
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <div class="sidebar-logo">Nex<span>Chat</span></div>
+      <div class="conn-dot" id="conn-dot"></div>
+    </div>
+
+    <!-- My identity -->
+    <div class="my-badge" id="my-badge" style="display:none">
+      <div class="avatar" id="my-avatar">?</div>
+      <div>
+        <div class="my-username" id="my-username-display"></div>
+        <div class="my-label">You</div>
+      </div>
+    </div>
+
+    <!-- Channels -->
+    <div class="sidebar-section">
+      <div class="section-header">
+        <span class="section-title">Channels</span>
+      </div>
+
+      <!-- Global -->
+      <div class="chat-item active" id="tab-global" onclick="switchChat('global')">
+        <div class="chat-item-icon">G</div>
+        <div class="chat-item-name">Global</div>
+      </div>
+    </div>
+
+    <!-- Rooms -->
+    <div class="sidebar-section">
+      <div class="section-header">
+        <span class="section-title">Rooms</span>
+        <span class="section-count" id="room-count">0</span>
+        <button class="section-btn" id="open-room-modal" title="Create / Join Room">+</button>
+      </div>
+      <div id="room-list"></div>
+    </div>
+
+    <!-- Online users / DMs -->
+    <div class="sidebar-section">
+      <div class="section-header">
+        <span class="section-title">Online</span>
+        <span class="section-count" id="user-count">0</span>
+      </div>
+    </div>
+    <div class="sidebar-scroll" id="user-list"></div>
+
+    <div class="sidebar-section section-card">
+      <div class="section-header">
+        <span class="section-title">DM Request</span>
+      </div>
+      <input id="dm-search-input" class="field-input compact-input" type="text" placeholder="Search by username" />
+      <button class="btn-primary compact-btn" id="dm-request-btn">Send Request</button>
+    </div>
+    <div class="sidebar-section section-card">
+      <div class="section-header">
+        <span class="section-title">Requests</span>
+      </div>
+      <div id="dm-requests-list"></div>
+    </div>
+  </aside>
+
+  <!-- CENTER CHAT -->
+  <main class="chat-area">
+    <div class="chat-header">
+      <div class="chat-header-icon" id="chat-icon">G</div>
+      <div class="chat-header-info">
+        <div class="chat-header-name" id="chat-name">Global</div>
+        <div class="chat-header-sub" id="chat-sub">Everyone in the server</div>
+      </div>
+      <div class="header-actions" id="room-actions" style="display:none">
+        <button class="icon-btn leave-btn" id="leave-room-btn" title="Leave Room">Exit</button>
+      </div>
+    </div>
+
+    <div id="global-online-panel" class="global-online-panel">
+      <div class="global-online-title">Online Now</div>
+      <div id="global-online-list" class="global-online-list"></div>
+    </div>
+
+    <div class="messages-wrap" id="messages"></div>
+
+    <div class="typing-indicator" id="typing-indicator"></div>
+
+    <div class="input-bar">
+      <textarea class="msg-input" id="msg-input"
+        placeholder="Message #global..." rows="1"></textarea>
+      <button class="send-btn" id="send-btn" disabled>Send</button>
+    </div>
+  </main>
+
+  <!-- RIGHT PANEL (room members) -->
+  <aside class="right-panel hidden" id="right-panel">
+    <div class="right-panel-header">Members</div>
+    <div class="right-panel-body" id="right-panel-body"></div>
+  </aside>
+</div>
+
+<!-- 
+     ROOM MODAL
+ -->
+<div class="modal-overlay" id="room-modal">
+  <div class="modal">
+    <button class="modal-close" id="close-room-modal">X</button>
+    <div class="modal-title">Rooms</div>
+    <div class="tab-row">
+      <div class="tab-pill active" id="tab-create" onclick="switchRoomTab('create')">Create</div>
+      <div class="tab-pill" id="tab-join" onclick="switchRoomTab('join')">Join</div>
+    </div>
+
+    <!-- Create tab -->
+    <div id="create-panel">
+      <div class="field-label">Room Name</div>
+      <input id="new-room-name" class="field-input" type="text"
+             placeholder="e.g. dev-talk" maxlength="30" />
+      <div class="register-error" id="create-room-error"></div>
+      <button class="btn-primary" id="create-room-btn" style="margin-top:16px">Create Room</button>
+    </div>
+
+    <!-- Join tab -->
+    <div id="join-panel" style="display:none">
+      <div class="field-label">Room ID</div>
+      <input id="join-room-id" class="field-input" type="text" placeholder="Enter room ID" maxlength="12" />
+      <button class="btn-primary" id="join-room-by-id-btn" style="margin-top:16px">Join By ID</button>
+      <p style="font-size:12px;color:var(--text3);margin-top:10px" id="no-rooms-msg">Only users with the room ID can join.</p>
+    </div>
+  </div>
+</div>
+
+<!--  Toast container -->
+<div id="toast-container"></div>
+
+  <script src="/assets/js/app.js" defer></script>
+</body>
+</html>
+
+
+

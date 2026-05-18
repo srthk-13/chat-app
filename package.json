@@ -1,0 +1,22 @@
+{
+  "name": "socket-chat-app",
+  "version": "1.0.0",
+  "description": "Full-stack real-time chat with Socket.IO — global, room & private chat",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.6.1",
+    "express": "^4.19.2",
+    "mongoose": "^8.19.1",
+    "socket.io": "^4.7.5"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
