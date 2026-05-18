@@ -56,19 +56,27 @@ function getRoomById(roomId) {
 
 function doRegister() {
   const input = document.getElementById("username-input");
+  const passInput = document.getElementById("password-input");
+  const signupCodeInput = document.getElementById("signup-code-input");
   const errEl = document.getElementById("register-error");
   const btn = document.getElementById("join-btn");
 
   const username = input.value.trim();
+  const password = passInput.value;
+  const signupCode = signupCodeInput.value.trim();
   if (!username) {
     errEl.textContent = "Enter a username.";
+    return;
+  }
+  if (!password || password.length < 6) {
+    errEl.textContent = "Enter a password (min 6 chars).";
     return;
   }
 
   btn.disabled = true;
   btn.textContent = "Connecting...";
 
-  socket.emit("register", { username }, ({ ok, error, username: uname, socketId }) => {
+  socket.emit("register", { username, password, signupCode }, ({ ok, error, username: uname, socketId }) => {
     if (!ok) {
       errEl.textContent = error;
       btn.disabled = false;
@@ -634,6 +642,9 @@ function sendDmRequest() {
 
 document.getElementById("join-btn").onclick = doRegister;
 document.getElementById("username-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") doRegister();
+});
+document.getElementById("password-input").addEventListener("keydown", (e) => {
   if (e.key === "Enter") doRegister();
 });
 

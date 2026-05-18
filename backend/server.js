@@ -20,6 +20,7 @@ const dmContacts = new Map(); // username -> Set<username>
 
 const MAX_HISTORY = 50;
 const MAX_MESSAGE_LENGTH = 2000;
+const GLOBAL_TTL_MS = 24 * 60 * 60 * 1000;
 
 const messageSchema = new mongoose.Schema(
   {
@@ -34,6 +35,13 @@ const messageSchema = new mongoose.Schema(
     timestamp: { type: Number, required: true, index: true },
   },
   { versionKey: false }
+);
+messageSchema.index(
+  { timestamp: 1 },
+  {
+    expireAfterSeconds: 24 * 60 * 60,
+    partialFilterExpression: { scope: "global" },
+  }
 );
 
 const roomSchema = new mongoose.Schema(
@@ -57,10 +65,19 @@ const dmRequestSchema = new mongoose.Schema(
   },
   { versionKey: false }
 );
+const userAccountSchema = new mongoose.Schema(
+  {
+    username: { type: String, required: true, unique: true, index: true },
+    passwordHash: { type: String, required: true },
+    createdAt: { type: Number, required: true },
+  },
+  { versionKey: false }
+);
 
 const ChatMessage = mongoose.model("ChatMessage", messageSchema);
 const ChatRoom = mongoose.model("ChatRoom", roomSchema);
 const DmRequest = mongoose.model("DmRequest", dmRequestSchema);
+const UserAccount = mongoose.model("UserAccount", userAccountSchema);
 
 function normalizeName(value) {
   return typeof value === "string" ? value.trim() : "";
@@ -74,6 +91,19 @@ function normalizeMessage(value) {
 
 function generateRoomId() {
   return crypto.randomBytes(3).toString("hex").toUpperCase();
+}
+
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.scryptSync(password, salt, 64).toString("hex");
+  return `${salt}:${hash}`;
+}
+
+function verifyPassword(password, stored) {
+  const [salt, expected] = (stored || "").split(":");
+  if (!salt || !expected) return false;
+  const candidate = crypto.scryptSync(password, salt, 64).toString("hex");
+  return crypto.timingSafeEqual(Buffer.from(expected, "hex"), Buffer.from(candidate, "hex"));
 }
 
 function getUserList() {
@@ -124,8 +154,8 @@ function areDmContacts(a, b) {
 }
 
 function removeUserFromDmContacts(username) {
-  dmContacts.delete(username);
-  for (const set of dmContacts.values()) set.delete(username);
+  // Keep accepted contacts persistent across sessions; only remove offline mapping from socket maps.
+  if (!username) return;
 }
 
 function getDmContactsForSocket(socketId) {
@@ -192,7 +222,11 @@ async function persistSystemMessage(text, scope, roomId = null, from = "System",
 }
 
 async function loadGlobalHistory() {
-  const docs = await ChatMessage.find({ scope: "global" }).sort({ timestamp: -1 }).limit(MAX_HISTORY).lean();
+  const minTs = Date.now() - GLOBAL_TTL_MS;
+  const docs = await ChatMessage.find({ scope: "global", timestamp: { $gte: minTs } })
+    .sort({ timestamp: -1 })
+    .limit(MAX_HISTORY)
+    .lean();
   return docs.reverse().map((d) => ({
     type: d.type,
     text: d.text,
@@ -202,6 +236,11 @@ async function loadGlobalHistory() {
     toId: d.toId,
     timestamp: d.timestamp,
   }));
+}
+
+async function deleteOldGlobalMessages() {
+  const minTs = Date.now() - GLOBAL_TTL_MS;
+  await ChatMessage.deleteMany({ scope: "global", timestamp: { $lt: minTs } });
 }
 
 async function loadRoomHistory(roomId) {
@@ -229,15 +268,47 @@ async function loadRoomsIntoMemory() {
   }
 }
 
+async function loadDmContactsIntoMemory() {
+  dmContacts.clear();
+  const accepted = await DmRequest.find({ status: "accepted" }).lean();
+  for (const req of accepted) {
+    addDmContactPair(req.fromUsername, req.toUsername);
+  }
+}
+
 io.on("connection", (socket) => {
   console.log(`[connect] ${socket.id}`);
 
   socket.on("register", async (payload = {}, cb = () => {}) => {
     try {
       const trimmed = normalizeName(payload.username);
+      const password = typeof payload.password === "string" ? payload.password : "";
+      const signupCode = normalizeName(payload.signupCode);
 
       if (!trimmed || trimmed.length < 2 || trimmed.length > 20) {
         return cb({ ok: false, error: "Username must be 2-20 characters." });
+      }
+      if (!password || password.length < 6) {
+        return cb({ ok: false, error: "Password must be at least 6 characters." });
+      }
+
+      const existingAccount = await UserAccount.findOne({ username: trimmed }).lean();
+      if (!existingAccount) {
+        const allowSignup = process.env.ALLOW_SIGNUP === "true";
+        const inviteCode = process.env.SIGNUP_INVITE_CODE || "";
+        if (!allowSignup) {
+          return cb({ ok: false, error: "Signup disabled. Ask admin for an account." });
+        }
+        if (inviteCode && signupCode !== inviteCode) {
+          return cb({ ok: false, error: "Invalid signup code." });
+        }
+        await UserAccount.create({
+          username: trimmed,
+          passwordHash: hashPassword(password),
+          createdAt: Date.now(),
+        });
+      } else if (!verifyPassword(password, existingAccount.passwordHash)) {
+        return cb({ ok: false, error: "Invalid username or password." });
       }
 
       const taken = [...users.values()].some(
@@ -557,7 +628,15 @@ async function start() {
   }
 
   await mongoose.connect(mongoUri);
+  await deleteOldGlobalMessages();
   await loadRoomsIntoMemory();
+  await loadDmContactsIntoMemory();
+
+  setInterval(() => {
+    deleteOldGlobalMessages().catch((err) => {
+      console.error("global ttl cleanup error", err);
+    });
+  }, 60 * 60 * 1000);
 
   const PORT = process.env.PORT || 3000;
   server.listen(PORT, () => {

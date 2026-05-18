@@ -43,6 +43,10 @@ cp .env.example .env
 ```
 Set `MONGO_URI` in `.env`.
 
+Auth-related env options:
+- `ALLOW_SIGNUP=false` blocks new account creation (recommended for production).
+- `SIGNUP_INVITE_CODE=<code>` requires this code for new signup when signup is enabled.
+
 3. Start app
 ```bash
 npm start
