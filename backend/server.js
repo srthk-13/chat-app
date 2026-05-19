@@ -296,10 +296,12 @@ io.on("connection", (socket) => {
       if (!existingAccount) {
         const allowSignup = process.env.ALLOW_SIGNUP === "true";
         const inviteCode = process.env.SIGNUP_INVITE_CODE || "";
-        if (!allowSignup) {
+        const accountCount = await UserAccount.estimatedDocumentCount();
+        const allowBootstrapFirstUser = accountCount === 0;
+        if (!allowSignup && !allowBootstrapFirstUser) {
           return cb({ ok: false, error: "Signup disabled. Ask admin for an account." });
         }
-        if (inviteCode && signupCode !== inviteCode) {
+        if (!allowBootstrapFirstUser && inviteCode && signupCode !== inviteCode) {
           return cb({ ok: false, error: "Invalid signup code." });
         }
         await UserAccount.create({
