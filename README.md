@@ -52,4 +52,4 @@ Auth-related env options:
 npm start
 ```
 
-Open `http://localhost:3000`.
+Open `http://localhost:3001`.
