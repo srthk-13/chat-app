@@ -54,39 +54,89 @@ function getRoomById(roomId) {
   return roomList.find((r) => r.id === roomId);
 }
 
-function doRegister() {
-  const input = document.getElementById("username-input");
-  const passInput = document.getElementById("password-input");
-  const signupCodeInput = document.getElementById("signup-code-input");
-  const errEl = document.getElementById("register-error");
+function resetRegisterButton() {
   const btn = document.getElementById("join-btn");
+  if (!btn) return;
+  btn.disabled = false;
+  btn.textContent = "Join Chat ->";
+}
 
-  const username = input.value.trim();
-  const password = passInput.value;
-  const signupCode = signupCodeInput.value.trim();
-  if (!username) {
-    errEl.textContent = "Enter a username.";
-    return;
-  }
-  if (!password || password.length < 6) {
-    errEl.textContent = "Enter a password (min 6 chars).";
-    return;
-  }
+function doRegister() {
+  try {
+    const input = document.getElementById("username-input");
+    const passInput = document.getElementById("password-input");
+    const signupCodeInput = document.getElementById("signup-code-input");
+    const errEl = document.getElementById("register-error");
+    const btn = document.getElementById("join-btn");
 
-  btn.disabled = true;
-  btn.textContent = "Connecting...";
-
-  socket.emit("register", { username, password, signupCode }, ({ ok, error, username: uname, socketId }) => {
-    if (!ok) {
-      errEl.textContent = error;
-      btn.disabled = false;
-      btn.textContent = "Join Chat ->";
+    const username = input.value.trim();
+    const password = passInput.value;
+    const signupCode = signupCodeInput.value.trim();
+    if (!username) {
+      errEl.textContent = "Enter a username.";
       return;
     }
-    myUsername = uname;
-    mySocketId = socketId;
-    onRegistered();
-  });
+    if (!password || password.length < 6) {
+      errEl.textContent = "Enter a password (min 6 chars).";
+      return;
+    }
+    if (!socket.connected) {
+      errEl.textContent = "Not connected to server. Retrying...";
+      socket.connect();
+      return;
+    }
+
+    errEl.textContent = "";
+    btn.disabled = true;
+    btn.textContent = "Connecting...";
+
+    const payload = { username, password, signupCode };
+    const handleResponse = (response = {}) => {
+      const { ok, error, username: uname, socketId } = response;
+      if (!ok) {
+        errEl.textContent = error || "Login failed.";
+        resetRegisterButton();
+        return;
+      }
+
+      myUsername = uname;
+      mySocketId = socketId;
+      onRegistered();
+    };
+
+    // Fallback for older Socket.IO clients that do not expose socket.timeout().
+    if (typeof socket.timeout === "function") {
+      socket.timeout(10000).emit("register", payload, (err, response = {}) => {
+        if (err) {
+          errEl.textContent = "Server did not respond. Check connection and try again.";
+          resetRegisterButton();
+          return;
+        }
+        handleResponse(response);
+      });
+      return;
+    }
+
+    let done = false;
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      errEl.textContent = "Server did not respond. Check connection and try again.";
+      resetRegisterButton();
+    }, 10000);
+
+    socket.emit("register", payload, (response = {}) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      handleResponse(response);
+    });
+  } catch (err) {
+    const errEl = document.getElementById("register-error");
+    if (errEl) errEl.textContent = "Unexpected login error. Please refresh and retry.";
+    resetRegisterButton();
+    console.error("doRegister error", err);
+  }
 }
 
 function onRegistered() {
@@ -106,9 +156,17 @@ function onRegistered() {
 socket.on("connect", () => document.getElementById("conn-dot").classList.remove("offline"));
 socket.on("disconnect", () => {
   document.getElementById("conn-dot").classList.add("offline");
+  const errEl = document.getElementById("register-error");
+  if (!myUsername && errEl) errEl.textContent = "Disconnected from server.";
+  resetRegisterButton();
   toast("Disconnected from server", "error");
 });
-socket.on("connect_error", () => toast("Connection error", "error"));
+socket.on("connect_error", () => {
+  const errEl = document.getElementById("register-error");
+  if (!myUsername && errEl) errEl.textContent = "Unable to connect to server.";
+  resetRegisterButton();
+  toast("Connection error", "error");
+});
 
 socket.on("global:history", (msgs) => {
   histories.global = msgs;

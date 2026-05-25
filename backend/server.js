@@ -9,9 +9,38 @@ const mongoose = require("mongoose");
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*" } });
+const NODE_ENV = process.env.NODE_ENV || "development";
+const IS_PROD = NODE_ENV === "production";
+const CORS_ORIGINS = (process.env.CORS_ORIGIN || "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+const ALLOW_ALL_ORIGINS = CORS_ORIGINS.length === 0 || CORS_ORIGINS.includes("*");
+
+const io = new Server(server, {
+  cors: {
+    origin(origin, cb) {
+      if (!origin || ALLOW_ALL_ORIGINS || CORS_ORIGINS.includes(origin)) {
+        return cb(null, true);
+      }
+      return cb(new Error("CORS origin not allowed"), false);
+    },
+    methods: ["GET", "POST"],
+  },
+});
+
+app.disable("x-powered-by");
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  next();
+});
 
 app.use(express.static(path.join(__dirname, "..", "public")));
+app.get("/healthz", (_req, res) => {
+  res.status(200).json({ ok: true, uptimeSec: Math.round(process.uptime()) });
+});
 
 const users = new Map(); // socketId -> { username, socketId }
 const rooms = new Map(); // roomId -> { id, name, members:Set<socketId>, createdBy }
@@ -21,6 +50,9 @@ const dmContacts = new Map(); // username -> Set<username>
 const MAX_HISTORY = 50;
 const MAX_MESSAGE_LENGTH = 2000;
 const GLOBAL_TTL_MS = 24 * 60 * 60 * 1000;
+const AUTH_WINDOW_MS = 5 * 60 * 1000;
+const MAX_AUTH_ATTEMPTS = 10;
+const authAttempts = new Map(); // key -> { count, firstAt }
 
 const messageSchema = new mongoose.Schema(
   {
@@ -32,7 +64,7 @@ const messageSchema = new mongoose.Schema(
     toId: { type: String },
     text: { type: String, required: true },
     type: { type: String, enum: ["message", "system"], default: "message" },
-    timestamp: { type: Number, required: true, index: true },
+    timestamp: { type: Number, required: true },
   },
   { versionKey: false }
 );
@@ -89,8 +121,43 @@ function normalizeMessage(value) {
   return text.slice(0, MAX_MESSAGE_LENGTH);
 }
 
+function getAuthKey(socket) {
+  return socket.handshake.address || socket.id;
+}
+
+function isAuthRateLimited(socket) {
+  const key = getAuthKey(socket);
+  const record = authAttempts.get(key);
+  if (!record) return false;
+  if (Date.now() - record.firstAt > AUTH_WINDOW_MS) {
+    authAttempts.delete(key);
+    return false;
+  }
+  return record.count >= MAX_AUTH_ATTEMPTS;
+}
+
+function recordAuthAttempt(socket, success) {
+  const key = getAuthKey(socket);
+  if (success) {
+    authAttempts.delete(key);
+    return;
+  }
+
+  const now = Date.now();
+  const current = authAttempts.get(key);
+  if (!current || now - current.firstAt > AUTH_WINDOW_MS) {
+    authAttempts.set(key, { count: 1, firstAt: now });
+    return;
+  }
+  current.count += 1;
+}
+
 function generateRoomId() {
   return crypto.randomBytes(3).toString("hex").toUpperCase();
+}
+
+function escapeRegex(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function hashPassword(password) {
@@ -100,10 +167,24 @@ function hashPassword(password) {
 }
 
 function verifyPassword(password, stored) {
-  const [salt, expected] = (stored || "").split(":");
-  if (!salt || !expected) return false;
-  const candidate = crypto.scryptSync(password, salt, 64).toString("hex");
-  return crypto.timingSafeEqual(Buffer.from(expected, "hex"), Buffer.from(candidate, "hex"));
+  try {
+    const [salt, expected] = (stored || "").split(":");
+    if (!salt || !expected) return false;
+
+    const expectedBuf = Buffer.from(expected, "hex");
+    if (expectedBuf.length !== 64) return false;
+
+    const candidateBuf = crypto.scryptSync(password, salt, 64);
+    if (candidateBuf.length !== expectedBuf.length) return false;
+    return crypto.timingSafeEqual(expectedBuf, candidateBuf);
+  } catch {
+    return false;
+  }
+}
+
+function findAccountByUsername(username) {
+  const rx = new RegExp(`^${escapeRegex(username)}$`, "i");
+  return UserAccount.findOne({ username: rx }).lean();
 }
 
 function getUserList() {
@@ -281,28 +362,39 @@ io.on("connection", (socket) => {
 
   socket.on("register", async (payload = {}, cb = () => {}) => {
     try {
+      console.log(`[auth] register attempt socket=${socket.id}`);
+      const fail = (error) => {
+        console.warn(`[auth] register failed for socket=${socket.id} user=${trimmed || "<empty>"} reason="${error}"`);
+        recordAuthAttempt(socket, false);
+        return cb({ ok: false, error });
+      };
+      if (isAuthRateLimited(socket)) {
+        return cb({ ok: false, error: "Too many login attempts. Please wait a few minutes." });
+      }
+
       const trimmed = normalizeName(payload.username);
       const password = typeof payload.password === "string" ? payload.password : "";
       const signupCode = normalizeName(payload.signupCode);
 
       if (!trimmed || trimmed.length < 2 || trimmed.length > 20) {
-        return cb({ ok: false, error: "Username must be 2-20 characters." });
+        return fail("Username must be 2-20 characters.");
       }
       if (!password || password.length < 6) {
-        return cb({ ok: false, error: "Password must be at least 6 characters." });
+        return fail("Password must be at least 6 characters.");
       }
 
-      const existingAccount = await UserAccount.findOne({ username: trimmed }).lean();
+      const existingAccount = await findAccountByUsername(trimmed);
       if (!existingAccount) {
-        const allowSignup = process.env.ALLOW_SIGNUP === "true";
-        const inviteCode = process.env.SIGNUP_INVITE_CODE || "";
+        const allowSignupEnv = (process.env.ALLOW_SIGNUP || "").toLowerCase();
+        const allowSignup = allowSignupEnv ? allowSignupEnv === "true" : !IS_PROD;
+        const inviteCode = normalizeName(process.env.SIGNUP_INVITE_CODE || "");
         const accountCount = await UserAccount.estimatedDocumentCount();
         const allowBootstrapFirstUser = accountCount === 0;
         if (!allowSignup && !allowBootstrapFirstUser) {
-          return cb({ ok: false, error: "Signup disabled. Ask admin for an account." });
+          return fail("Signup disabled. Ask admin for an account.");
         }
         if (!allowBootstrapFirstUser && inviteCode && signupCode !== inviteCode) {
-          return cb({ ok: false, error: "Invalid signup code." });
+          return fail("Invalid signup code.");
         }
         await UserAccount.create({
           username: trimmed,
@@ -310,18 +402,20 @@ io.on("connection", (socket) => {
           createdAt: Date.now(),
         });
       } else if (!verifyPassword(password, existingAccount.passwordHash)) {
-        return cb({ ok: false, error: "Invalid username or password." });
+        return fail("Invalid username or password.");
       }
 
+      const usernameForSession = existingAccount?.username || trimmed;
       const taken = [...users.values()].some(
-        (u) => u.username.toLowerCase() === trimmed.toLowerCase()
+        (u) => u.username.toLowerCase() === usernameForSession.toLowerCase()
       );
-      if (taken) return cb({ ok: false, error: "Username already taken. Choose another." });
+      if (taken) return fail("Username already taken. Choose another.");
 
-      users.set(socket.id, { username: trimmed, socketId: socket.id });
+      users.set(socket.id, { username: usernameForSession, socketId: socket.id });
       socket.join("__global__");
+      recordAuthAttempt(socket, true);
 
-      cb({ ok: true, username: trimmed, socketId: socket.id });
+      cb({ ok: true, username: usernameForSession, socketId: socket.id });
 
       socket.emit("global:history", await loadGlobalHistory());
       emitUsersUpdate();
@@ -329,10 +423,11 @@ io.on("connection", (socket) => {
       emitDmRequestsFor(socket.id);
       emitDmContactsFor(socket.id);
 
-      const sysMsg = await persistSystemMessage(`${trimmed} joined the chat`, "global");
+      const sysMsg = await persistSystemMessage(`${usernameForSession} joined the chat`, "global");
       io.to("__global__").emit("global:message", sysMsg);
     } catch (err) {
       console.error("register error", err);
+      recordAuthAttempt(socket, false);
       cb({ ok: false, error: "Server error." });
     }
   });
@@ -427,9 +522,7 @@ io.on("connection", (socket) => {
         await ChatRoom.updateOne({ roomId }, { $pull: { members: user.username } });
       }
 
-      if (room.members.size === 0) {
-        rooms.delete(roomId);
-      } else {
+      if (room.members.size > 0) {
         const sysMsg = await persistSystemMessage(`${user?.username ?? "Someone"} left the room`, "room", roomId, user?.username ?? "System", socket.id);
         io.to(`room:${roomId}`).emit("room:message", { roomId, roomName: room.name, msg: sysMsg });
       }
@@ -594,39 +687,48 @@ io.on("connection", (socket) => {
     const user = users.get(socket.id);
     if (!user) return;
 
-    for (const [roomId, room] of rooms.entries()) {
-      if (!room.members.has(socket.id)) continue;
-      room.members.delete(socket.id);
-      await ChatRoom.updateOne({ roomId }, { $pull: { members: user.username } });
+    try {
+      for (const [roomId, room] of rooms.entries()) {
+        if (!room.members.has(socket.id)) continue;
+        room.members.delete(socket.id);
+        await ChatRoom.updateOne({ roomId }, { $pull: { members: user.username } });
 
-      if (room.members.size !== 0) {
-        const sysMsg = await persistSystemMessage(`${user.username} left the room`, "room", roomId, user.username, socket.id);
-        io.to(`room:${roomId}`).emit("room:message", { roomId, roomName: room.name, msg: sysMsg });
+        if (room.members.size !== 0) {
+          const sysMsg = await persistSystemMessage(`${user.username} left the room`, "room", roomId, user.username, socket.id);
+          io.to(`room:${roomId}`).emit("room:message", { roomId, roomName: room.name, msg: sysMsg });
+        }
       }
+
+      const sysMsg = await persistSystemMessage(`${user.username} left the chat`, "global", null, user.username, socket.id);
+      io.to("__global__").emit("global:message", sysMsg);
+    } catch (err) {
+      console.error("disconnect error", err);
+    } finally {
+      users.delete(socket.id);
+      removeUserFromDmContacts(user.username);
+
+      pendingDmRequests.delete(socket.id);
+      for (const [toSocketId, reqMap] of pendingDmRequests.entries()) {
+        if (reqMap.delete(socket.id) && reqMap.size === 0) pendingDmRequests.delete(toSocketId);
+        emitDmRequestsFor(toSocketId);
+      }
+
+      emitUsersUpdate();
+      emitRoomsUpdate();
+      emitDmContactsUpdate();
     }
-
-    users.delete(socket.id);
-    removeUserFromDmContacts(user.username);
-
-    pendingDmRequests.delete(socket.id);
-    for (const [toSocketId, reqMap] of pendingDmRequests.entries()) {
-      if (reqMap.delete(socket.id) && reqMap.size === 0) pendingDmRequests.delete(toSocketId);
-      emitDmRequestsFor(toSocketId);
-    }
-
-    const sysMsg = await persistSystemMessage(`${user.username} left the chat`, "global", null, user.username, socket.id);
-    io.to("__global__").emit("global:message", sysMsg);
-
-    emitUsersUpdate();
-    emitRoomsUpdate();
-    emitDmContactsUpdate();
   });
 });
+
+let cleanupTimer;
 
 async function start() {
   const mongoUri = process.env.MONGO_URI;
   if (!mongoUri) {
     throw new Error("MONGO_URI is not set. Add it in environment variables or .env file.");
+  }
+  if (IS_PROD && ALLOW_ALL_ORIGINS) {
+    throw new Error("CORS_ORIGIN must be set in production (comma-separated allowed origins).");
   }
 
   await mongoose.connect(mongoUri);
@@ -634,17 +736,40 @@ async function start() {
   await loadRoomsIntoMemory();
   await loadDmContactsIntoMemory();
 
-  setInterval(() => {
+  cleanupTimer = setInterval(() => {
     deleteOldGlobalMessages().catch((err) => {
       console.error("global ttl cleanup error", err);
     });
   }, 60 * 60 * 1000);
 
-  const PORT = process.env.PORT || 3000;
+  const parsedPort = Number.parseInt(process.env.PORT, 10);
+  const PORT = Number.isInteger(parsedPort) && parsedPort > 0 ? parsedPort : 3000;
   server.listen(PORT, () => {
     console.log(`Chat server running -> http://localhost:${PORT}`);
   });
 }
+
+async function shutdown(signal) {
+  console.log(`Received ${signal}. Shutting down...`);
+  if (cleanupTimer) clearInterval(cleanupTimer);
+  await new Promise((resolve) => server.close(resolve));
+  await mongoose.connection.close();
+  process.exit(0);
+}
+
+process.on("SIGINT", () => {
+  shutdown("SIGINT").catch((err) => {
+    console.error("shutdown error", err);
+    process.exit(1);
+  });
+});
+
+process.on("SIGTERM", () => {
+  shutdown("SIGTERM").catch((err) => {
+    console.error("shutdown error", err);
+    process.exit(1);
+  });
+});
 
 start().catch((err) => {
   console.error("Failed to start server:", err);
